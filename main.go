@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -71,9 +73,23 @@ func readFloat(reader *bufio.Reader, prompt string) (float64, error) {
 }
 
 func handleGetItems(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return // клиент ушёл или сработал таймаут — писать уже некуда
+	}
 	if r.Method != http.MethodGet {
 		sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Искусственная задержка для демонстрации TimeoutHandler и r.Context()
+	if d, err := time.ParseDuration(r.URL.Query().Get("delay")); err == nil && d > 0 {
+		select {
+		case <-time.After(d):
+			// продолжаем
+		case <-r.Context().Done():
+			log.Printf("GET /items: запрос отменён: %v", r.Context().Err())
+			return
+		}
 	}
 
 	store.mu.RLock()
@@ -91,6 +107,9 @@ func handleGetItems(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func handleGetItem(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return // клиент ушёл или сработал таймаут — писать уже некуда
+	}
 	idStr := r.PathValue("id") // Получение id из пути
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -111,6 +130,9 @@ func handleGetItem(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(item)
 }
 func handleAddItem(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return // клиент ушёл или сработал таймаут — писать уже некуда
+	}
 	// mime.ParseMediaType корректно обрабатывает "application/json; charset=utf-8"
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
@@ -154,6 +176,9 @@ func handleAddItem(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(createdItem)
 }
 func handleDeleteItem(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Err() != nil {
+		return // клиент ушёл или сработал таймаут — писать уже некуда
+	}
 	idStr := r.PathValue("id")
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -236,6 +261,29 @@ func jsonErrorMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// newHandler собирает mux + middleware + TimeoutHandler
+func newHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items", handleGetItems)
+	mux.HandleFunc("GET /items/{id}", handleGetItem)
+	mux.HandleFunc("POST /items", handleAddItem)
+	mux.HandleFunc("DELETE /items/{id}", handleDeleteItem)
+
+	// 8 секунд — общий лимит на обработку запроса
+	timeoutHandler := http.TimeoutHandler(
+		jsonErrorMiddleware(mux),
+		8*time.Second,
+		`{"error":"request timeout"}`,
+	)
+
+	// Обёртка: заранее выставляем Content-Type: application/json,
+	// чтобы и ответ TimeoutHandler (503) имел правильный заголовок.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		timeoutHandler.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP Server address")
 
@@ -244,19 +292,11 @@ func main() {
 	}
 	flag.Parse()
 
-	mux := http.NewServeMux() // Мультиплексор запросов
-
-	mux.HandleFunc("GET /items", handleGetItems)
-	mux.HandleFunc("GET /items/{id}", handleGetItem)
-	mux.HandleFunc("POST /items", handleAddItem)
-	mux.HandleFunc("DELETE /items/{id}", handleDeleteItem)
-
-	//Конфиг сервера
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           jsonErrorMiddleware(mux),
-		ReadHeaderTimeout: 5 * time.Second,  // Защита от медленных атак
-		WriteTimeout:      10 * time.Second, // Максимальное время на формирование ответа
+		Handler:           newHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second, // > 8s, чтобы первым сработал TimeoutHandler
 	}
 
 	go func() {
@@ -264,6 +304,26 @@ func main() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Ошибка сервера: %v", err)
 		}
+	}()
+
+	// Перехват SIGINT (Ctrl+C) и SIGTERM
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	go func() {
+		<-sigCtx.Done()
+		stopSignals() // последующие сигналы обрабатываются по умолчанию (аварийно)
+		log.Println("\nПолучен сигнал завершения. Останавливаем сервер...")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Ошибка при остановке сервера: %v", err)
+		} else {
+			log.Println("Сервер остановлен корректно.")
+		}
+		os.Exit(0)
 	}()
 
 	reader := bufio.NewReader(os.Stdin)
@@ -289,11 +349,14 @@ func main() {
 		}
 		switch a {
 		case 0:
-			fmt.Println("Завершение работы...")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := server.Shutdown(ctx); err != nil {
+			log.Println("Завершение работы сервера...")
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := server.Shutdown(shutdownCtx)
+			cancel()
+			if err != nil {
 				log.Printf("Ошибка при остановке: %v", err)
+			} else {
+				log.Println("Сервер остановлен корректно.")
 			}
 			return
 		case 1:
