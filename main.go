@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
@@ -70,22 +72,22 @@ func readFloat(reader *bufio.Reader, prompt string) (float64, error) {
 
 func handleGetItems(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+		sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 
-	// Формируем срез
 	itemsList := make([]Item, 0, len(store.items))
 	for _, item := range store.items {
 		itemsList = append(itemsList, item)
 	}
-	w.Header().Set("Content-Type", "application/json")
 
-	if err := json.NewEncoder(w).Encode(itemsList); err != nil { // Запись в JSON
-		http.Error(w, `{"error":"Failed to encode response"}`, http.StatusInternalServerError)
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(itemsList); err != nil {
+		// тело уже пошло клиенту, статус менять поздно — только логируем
+		log.Printf("encode error: %v", err)
 	}
 }
 func handleGetItem(w http.ResponseWriter, r *http.Request) {
@@ -109,35 +111,47 @@ func handleGetItem(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(item)
 }
 func handleAddItem(w http.ResponseWriter, r *http.Request) {
-	// Проверка на соответствие JSON
-	if r.Header.Get("Content-Type") != "application/json" {
-		sendJSONError(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType) // Код 415
+	// mime.ParseMediaType корректно обрабатывает "application/json; charset=utf-8"
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		sendJSONError(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
 
 	var newItem Item
-	if err := json.NewDecoder(r.Body).Decode(&newItem); err != nil { // Запись в JSON
-		http.Error(w, `{"error":"Failed to encode response"}`, http.StatusInternalServerError)
+	// битый или пустой JSON теперь возвращает 400, а не 500
+	if err := json.NewDecoder(r.Body).Decode(&newItem); err != nil {
+		sendJSONError(w, "Invalid or empty JSON body", http.StatusBadRequest)
 		return
 	}
+
 	if newItem.Name == "" {
 		sendJSONError(w, "Name is required", http.StatusBadRequest)
 		return
 	}
 
+	// запрет отрицательной цены
+	if newItem.Price < 0 {
+		sendJSONError(w, "Price cannot be negative", http.StatusBadRequest)
+		return
+	}
+
 	newID := int(nextID.Add(1))
-	//Запись товара
-	store.mu.Lock()
-	store.items[newID] = Item{
+
+	// Сохраняем товар в локальную переменную, чтобы избежать гонки
+	createdItem := Item{
 		ID:    newID,
 		Name:  newItem.Name,
 		Price: newItem.Price,
 	}
+
+	store.mu.Lock()
+	store.items[newID] = createdItem
 	store.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(store.items[newID])
+	json.NewEncoder(w).Encode(createdItem)
 }
 func handleDeleteItem(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
@@ -170,6 +184,58 @@ func sendJSONError(w http.ResponseWriter, message string, statusCode int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
+// перехватывает стандартные ТЕКСТОВЫЕ ответы mux (404, 405)
+// и подменяет их на JSON. Ответы наших обработчиков не трогает.
+type jsonErrorWrapper struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	hijacked    bool
+}
+
+func (w *jsonErrorWrapper) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.status = status
+
+	isMuxError := status == http.StatusNotFound || status == http.StatusMethodNotAllowed
+	alreadyJSON := strings.HasPrefix(w.Header().Get("Content-Type"), "application/json")
+
+	if isMuxError && !alreadyJSON {
+		msg := "not found"
+		if status == http.StatusMethodNotAllowed {
+			msg = "method not allowed"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.ResponseWriter.WriteHeader(status)
+		json.NewEncoder(w.ResponseWriter).Encode(map[string]string{"error": msg})
+		w.hijacked = true // дальше всё, что напишет mux, будем выбрасывать
+		return
+	}
+
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *jsonErrorWrapper) Write(b []byte) (int, error) {
+	if !w.wroteHeader { // если Write вызван раньше WriteHeader — статус 200
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.hijacked {
+		// mux пытается дописать "404 page not found\n" поверх нашего JSON.
+		// Делаем вид, что записали, но байты выбрасываем.
+		return len(b), nil
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func jsonErrorMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(&jsonErrorWrapper{ResponseWriter: w}, r)
+	})
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP Server address")
 
@@ -188,7 +254,7 @@ func main() {
 	//Конфиг сервера
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           jsonErrorMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,  // Защита от медленных атак
 		WriteTimeout:      10 * time.Second, // Максимальное время на формирование ответа
 	}
@@ -213,6 +279,7 @@ func main() {
 		fmt.Println("2 - Получить один товар")
 		fmt.Println("3 - Добавить товар")
 		fmt.Println("4 - Удалить товар")
+		fmt.Println("5 - Выполнить произвольную команду")
 		fmt.Println("0 - Завершить работу")
 
 		a, err := readInt(reader, "Выберите пункт из меню управления:")
@@ -222,8 +289,12 @@ func main() {
 		}
 		switch a {
 		case 0:
-			fmt.Println("Завершение работы")
-			server.Close()
+			fmt.Println("Завершение работы...")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(ctx); err != nil {
+				log.Printf("Ошибка при остановке: %v", err)
+			}
 			return
 		case 1:
 			resp, err := http.Get(baseURL + "/items")
@@ -279,7 +350,23 @@ func main() {
 			} else {
 				printResponse(resp)
 			}
+		case 5:
+			cmd := readString(reader, "Введите команду:")
+			if cmd == "" {
+				continue
+			}
+			var execCmd *exec.Cmd
+			if runtime.GOOS == "windows" {
 
+				execCmd = exec.Command("powershell", "-Command", cmd)
+			} else {
+				execCmd = exec.Command("sh", "-c", cmd)
+			}
+			execCmd.Stdout = os.Stdout
+			execCmd.Stderr = os.Stderr
+			if err := execCmd.Run(); err != nil {
+				fmt.Printf("Ошибка выполнения: %v\n", err)
+			}
 		default:
 			fmt.Println("Неверный пункт меню. Попробуйте снова.")
 			time.Sleep(1 * time.Second)
@@ -295,7 +382,7 @@ func printResponse(resp *http.Response) {
 	var buf bytes.Buffer
 	buf.ReadFrom(resp.Body)
 
-	fmt.Printf("\n📡 Статус ответа: %s\n", resp.Status)
+	fmt.Printf("\n Статус ответа: %s\n", resp.Status)
 
 	// Пытаемся отформатировать JSON с отступами для красоты
 	var prettyJSON bytes.Buffer
