@@ -5,12 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard) // глушим логи на время тестов
+	os.Exit(m.Run())
+}
 
 // resetState обнуляет глобальное хранилище и счётчик ID.
 func resetState() {
