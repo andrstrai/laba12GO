@@ -299,6 +299,20 @@ func main() {
 		WriteTimeout:      10 * time.Second, // > 8s, чтобы первым сработал TimeoutHandler
 	}
 
+	var shutdownOnce sync.Once
+	doShutdown := func(reason string) {
+		shutdownOnce.Do(func() {
+			log.Println(reason)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				log.Printf("Ошибка при остановке сервера: %v", err)
+			} else {
+				log.Println("Сервер остановлен корректно.")
+			}
+		})
+	}
+
 	go func() {
 		log.Printf("Сервер запущен по адресу: http://localhost%s", *addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -312,17 +326,8 @@ func main() {
 
 	go func() {
 		<-sigCtx.Done()
-		stopSignals() // последующие сигналы обрабатываются по умолчанию (аварийно)
-		log.Println("\nПолучен сигнал завершения. Останавливаем сервер...")
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Ошибка при остановке сервера: %v", err)
-		} else {
-			log.Println("Сервер остановлен корректно.")
-		}
+		stopSignals()
+		doShutdown("\nПолучен сигнал завершения. Останавливаем сервер...")
 		os.Exit(0)
 	}()
 
@@ -349,15 +354,7 @@ func main() {
 		}
 		switch a {
 		case 0:
-			log.Println("Завершение работы сервера...")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := server.Shutdown(shutdownCtx)
-			cancel()
-			if err != nil {
-				log.Printf("Ошибка при остановке: %v", err)
-			} else {
-				log.Println("Сервер остановлен корректно.")
-			}
+			doShutdown("Завершение работы сервера...")
 			return
 		case 1:
 			resp, err := http.Get(baseURL + "/items")
