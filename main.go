@@ -246,7 +246,7 @@ func main() {
 			name := readString(reader, "Введите название товара:")
 			price, err := readFloat(reader, "Введите цену товара:")
 			if err != nil {
-				fmt.Println("⚠️ Ошибка: некорректная цена!")
+				fmt.Println("Ошибка: некорректная цена!")
 				time.Sleep(1 * time.Second)
 				continue
 			}
