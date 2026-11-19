@@ -268,6 +268,7 @@ func newHandler() http.Handler {
 	mux.HandleFunc("GET /items/{id}", handleGetItem)
 	mux.HandleFunc("POST /items", handleAddItem)
 	mux.HandleFunc("DELETE /items/{id}", handleDeleteItem)
+	mux.HandleFunc("GET /stats", handleStats)
 
 	// 8 секунд — общий лимит на обработку запроса
 	timeoutHandler := http.TimeoutHandler(
@@ -278,10 +279,13 @@ func newHandler() http.Handler {
 
 	// Обёртка: заранее выставляем Content-Type: application/json,
 	// чтобы и ответ TimeoutHandler (503) имел правильный заголовок.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	jsonHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		timeoutHandler.ServeHTTP(w, r)
 	})
+
+	// Снаружи всего: лог, внутри него счётчик запросов
+	return logRequests(countRequests(jsonHandler))
 }
 
 func main() {
@@ -345,6 +349,7 @@ func main() {
 		fmt.Println("3 - Добавить товар")
 		fmt.Println("4 - Удалить товар")
 		fmt.Println("5 - Выполнить произвольную команду")
+		fmt.Println("6 - Статистика сервера")
 		fmt.Println("0 - Завершить работу")
 
 		a, err := readInt(reader, "Выберите пункт из меню управления:")
@@ -426,6 +431,13 @@ func main() {
 			execCmd.Stderr = os.Stderr
 			if err := execCmd.Run(); err != nil {
 				fmt.Printf("Ошибка выполнения: %v\n", err)
+			}
+		case 6:
+			resp, err := http.Get(baseURL + "/stats")
+			if err != nil {
+				fmt.Printf("Ошибка запроса: %v\n", err)
+			} else {
+				printResponse(resp)
 			}
 		default:
 			fmt.Println("Неверный пункт меню. Попробуйте снова.")
